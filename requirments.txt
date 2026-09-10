@@ -1,0 +1,7 @@
+streamlit1.42.0
+pandas2.2.3
+numpy2.2.2
+opencv-python-headless4.11.0.86
+easyocr1.7.2
+PyMuPDF1.25.3
+reportlab==4.3.1
