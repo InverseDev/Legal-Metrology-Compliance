@@ -1398,7 +1398,7 @@ def evaluate_compliance(
 
     status = (
         "COMPLIANT"
-        if score >= 80
+        if score >= 100
         else
         "NON-COMPLIANT"
     )
@@ -2631,12 +2631,15 @@ with tab_dashboard:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-
+    # -----------------------------
+    # Post-scan workspace
+    # -----------------------------
     data = get_current_result()
     if data:
         checks = data["checks"]
         field_confidence = data["field_confidence"]
         
+        # Suppress manual requirement for MRP if it was detected
         manual_required_map = {
             rule: (False if (rule == "MRP Present" and checks.get(rule, False)) else criterion_low_conf(rule, field_confidence))
             for rule in RULE_LABELS
@@ -2701,6 +2704,7 @@ with tab_dashboard:
                 reset_inspection()
                 st.rerun()
 
+        # If a report has already been generated, retain its download button after reruns.
         if st.session_state.ui_last_report:
             current_id = st.session_state.ui_last_scan_id or "latest"
             st.download_button(
