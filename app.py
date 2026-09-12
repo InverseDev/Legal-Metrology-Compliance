@@ -10,7 +10,7 @@ import easyocr
 import numpy as np
 import pandas as pd
 import streamlit as st
-import fitz 
+import pymupdf
 
 
 st.set_page_config(
@@ -27,7 +27,7 @@ def load_easyocr_reader():
     """
     return easyocr.Reader(
         ["en"],
-        gpu=False,
+        gpu=True,
         verbose=False
     )
 
@@ -113,7 +113,7 @@ def pdf_to_images(pdf_bytes):
     exactly like a normal uploaded image.
     """
 
-    pdf_document = fitz.open(
+    pdf_document = pymupdf.open(
         stream=pdf_bytes,
         filetype="pdf"
     )
@@ -131,7 +131,7 @@ def pdf_to_images(pdf_bytes):
             )
 
             pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
+                matrix=pymupdf.Matrix(2, 2),
                 alpha=False
             )
 
@@ -188,13 +188,18 @@ def bytes_to_image(image_bytes):
 
 def upscale_image(
     img,
-    max_dim=1400
+    max_dim=1400,
+    min_dim=900
 ):
     """
-    Resize only when the image is larger than max_dim.
+    Resize down when the image is larger than max_dim, or up
+    when it's smaller than min_dim.
 
-    Keeping this around 1400 instead of 2000 helps
-    significantly with OCR speed.
+    Keeping max_dim around 1400 instead of 2000 helps
+    significantly with OCR speed. Small/far-away label photos
+    are upscaled back up toward min_dim (capped by max_dim) so
+    small print doesn't collapse to only a couple of pixels
+    tall, which is a common cause of missed detections.
     """
 
     h, w = img.shape[:2]
@@ -204,21 +209,44 @@ def upscale_image(
         w
     )
 
-    if longest <= max_dim:
-        return img
-
-    scale = (
-        max_dim /
-        longest
+    shortest = min(
+        h,
+        w
     )
 
-    return cv2.resize(
-        img,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_AREA
-    )
+    if longest > max_dim:
+
+        scale = (
+            max_dim /
+            longest
+        )
+
+        return cv2.resize(
+            img,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA
+        )
+
+    if shortest < min_dim and longest > 0:
+
+        scale = min(
+            min_dim / shortest,
+            max_dim / longest
+        )
+
+        if scale > 1.0:
+
+            return cv2.resize(
+                img,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+    return img
 
 
 def preprocess_fallback(img):
@@ -248,6 +276,129 @@ def preprocess_fallback(img):
     )
 
     # Adaptive threshold
+
+    adaptive = cv2.adaptiveThreshold(
+        contrast,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+
+    return adaptive
+
+
+# Below this variance (Laplacian of a grayscale, resolution-normalized
+# image), a capture is treated as blurry enough to need dedicated
+# handling rather than the standard fallback pass.
+BLUR_VARIANCE_THRESHOLD = 60.0
+
+
+def compute_blur_score(img):
+    """
+    Variance of the Laplacian as a focus/sharpness measure.
+
+    Lower values mean a softer, more out-of-focus image. This is
+    computed on the already-resized working image so the score is
+    comparable across captures of different original resolutions.
+    """
+
+    gray = (
+        cv2.cvtColor(
+            img,
+            cv2.COLOR_BGR2GRAY
+        )
+        if img.ndim == 3
+        else img
+    )
+
+    laplacian = cv2.Laplacian(
+        gray,
+        cv2.CV_64F
+    )
+
+    return float(
+        laplacian.var()
+    )
+
+
+def is_blurry(
+    img,
+    threshold=BLUR_VARIANCE_THRESHOLD
+):
+
+    return (
+        compute_blur_score(img) <
+        threshold
+    )
+
+
+def sharpen_image(
+    img,
+    amount=1.0,
+    radius=3
+):
+    """
+    Unsharp mask: subtract a blurred copy from the original to
+    push back contrast lost to focus blur or motion blur, without
+    the artifacts a naive sharpening kernel introduces.
+    """
+
+    blurred = cv2.GaussianBlur(
+        img,
+        (0, 0),
+        radius
+    )
+
+    sharpened = cv2.addWeighted(
+        img,
+        1 + amount,
+        blurred,
+        -amount,
+        0
+    )
+
+    return sharpened
+
+
+def preprocess_blur_fallback(img):
+    """
+    Preprocessing variant tailored to blurry captures.
+
+    Runs an unsharp mask first to recover edge contrast, then a
+    slightly stronger CLAHE pass, then an edge-preserving
+    (bilateral) denoise instead of the Gaussian blur used in
+    preprocess_fallback, since a Gaussian blur would immediately
+    undo the sharpening step on an already-soft image.
+    """
+
+    sharpened = sharpen_image(
+        img,
+        amount=1.3,
+        radius=4
+    )
+
+    gray = cv2.cvtColor(
+        sharpened,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=3.0,
+        tileGridSize=(8, 8)
+    )
+
+    contrast = clahe.apply(
+        gray
+    )
+
+    contrast = cv2.bilateralFilter(
+        contrast,
+        d=5,
+        sigmaColor=40,
+        sigmaSpace=40
+    )
 
     adaptive = cv2.adaptiveThreshold(
         contrast,
@@ -619,19 +770,49 @@ def extract_single_label_data(
         image_bytes
     )
 
-    # Smaller max dimension = considerably faster OCR
+    # Smaller max dimension = considerably faster OCR.
+    # Small/far-away captures also get upscaled back up inside
+    # upscale_image so tiny print doesn't fall below what OCR
+    # can resolve.
 
     img = upscale_image(
         original,
         max_dim=1400
     )
 
+    blur_score = compute_blur_score(
+        img
+    )
+
+    blurry = blur_score < BLUR_VARIANCE_THRESHOLD
+
     all_results = []
+
+    # For a blurry capture, feed EasyOCR an unsharp-masked version
+    # on the primary pass instead of the raw soft image — sharp
+    # edges recover a meaningful share of detections that would
+    # otherwise only show up on the fallback pass.
+
+    primary_source = (
+        sharpen_image(
+            img,
+            amount=1.0,
+            radius=3
+        )
+        if blurry
+        else img
+    )
+
+    primary_variant = (
+        "sharpened"
+        if blurry
+        else "original"
+    )
 
     try:
 
         raw_results = run_easyocr(
-            img
+            primary_source
         )
 
         for result in raw_results:
@@ -665,7 +846,7 @@ def extract_single_label_data(
                         text,
                         confidence,
                         "easyocr",
-                        "original"
+                        primary_variant
                     )
                 )
 
@@ -689,57 +870,75 @@ def extract_single_label_data(
         first_count < 3
         or
         first_confidence < 0.55
+        or
+        blurry
     )
 
     if needs_fallback:
 
-        fallback = preprocess_fallback(
-            img
-        )
+        fallback_variants = []
 
-        try:
+        if blurry:
 
-            raw_results = run_easyocr(
-                fallback
+            fallback_variants.append(
+                (
+                    "blur_fallback",
+                    preprocess_blur_fallback(img)
+                )
             )
 
-            for result in raw_results:
+        fallback_variants.append(
+            (
+                "adaptive_fallback",
+                preprocess_fallback(img)
+            )
+        )
 
-                if (
-                    not isinstance(
-                        result,
-                        (tuple, list)
-                    )
-                    or
-                    len(result) != 3
-                ):
-                    continue
+        for variant_name, variant_image in fallback_variants:
 
-                bbox, text, confidence = result
+            try:
 
-                try:
+                raw_results = run_easyocr(
+                    variant_image
+                )
 
-                    confidence = float(
-                        confidence
-                    )
+                for result in raw_results:
 
-                except Exception:
-                    continue
-
-                if confidence >= conf_threshold:
-
-                    all_results.append(
-                        (
-                            bbox,
-                            text,
-                            confidence,
-                            "easyocr",
-                            "adaptive_fallback"
+                    if (
+                        not isinstance(
+                            result,
+                            (tuple, list)
                         )
-                    )
+                        or
+                        len(result) != 3
+                    ):
+                        continue
 
-        except Exception:
-            pass
+                    bbox, text, confidence = result
+
+                    try:
+
+                        confidence = float(
+                            confidence
+                        )
+
+                    except Exception:
+                        continue
+
+                    if confidence >= conf_threshold:
+
+                        all_results.append(
+                            (
+                                bbox,
+                                text,
+                                confidence,
+                                "easyocr",
+                                variant_name
+                            )
+                        )
+
+            except Exception:
+                pass
 
     merged = merge_detections(
         all_results,
@@ -2219,7 +2418,7 @@ tab_dashboard, tab_database = st.tabs(["◉ Dashboard", "▣ Database"])
 # DASHBOARD
 # ============================================================
 with tab_dashboard:
-    if st.button("＋ New Inspection", type="primary", use_container_width=True, key="top_new_inspection"):
+    if st.button("＋ New Inspection", type="primary", width='stretch', key="top_new_inspection"):
         reset_inspection()
         st.rerun()
 
@@ -2287,13 +2486,13 @@ with tab_dashboard:
                 try:
                     preview = bytes_to_image(item["bytes"])
                     with preview_cols[idx % len(preview_cols)]:
-                        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True, caption=f"Side {idx + 1}")
+                        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), width='stretch', caption=f"Side {idx + 1}")
                 except Exception:
                     with preview_cols[idx % len(preview_cols)]:
                         st.caption(f"Side {idx + 1}")
 
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        start_scan = st.button("Scan packaging", type="primary", use_container_width=True, key="start_scan")
+        start_scan = st.button("Scan packaging", type="primary", width='stretch', key="start_scan")
     else:
         start_scan = False
         st.info("Add at least one image, PDF, or camera capture to start an inspection.")
@@ -2432,15 +2631,12 @@ with tab_dashboard:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # -----------------------------
-    # Post-scan workspace
-    # -----------------------------
+
     data = get_current_result()
     if data:
         checks = data["checks"]
         field_confidence = data["field_confidence"]
         
-        # Suppress manual requirement for MRP if it was detected
         manual_required_map = {
             rule: (False if (rule == "MRP Present" and checks.get(rule, False)) else criterion_low_conf(rule, field_confidence))
             for rule in RULE_LABELS
@@ -2496,16 +2692,15 @@ with tab_dashboard:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         report_col, clear_col = st.columns([2.2, 1], gap="medium")
         with report_col:
-            if st.button("Generate final report", type="primary", use_container_width=True, key="generate_report"):
+            if st.button("Generate final report", type="primary", width='stretch', key="generate_report"):
                 result = save_current_scan_as_final()
                 if result:
                     st.success("Final report prepared and inspection saved to the database.")
         with clear_col:
-            if st.button("Start over", use_container_width=True, key="start_over"):
+            if st.button("Start over", width='stretch', key="start_over"):
                 reset_inspection()
                 st.rerun()
 
-        # If a report has already been generated, retain its download button after reruns.
         if st.session_state.ui_last_report:
             current_id = st.session_state.ui_last_scan_id or "latest"
             st.download_button(
@@ -2513,7 +2708,7 @@ with tab_dashboard:
                 data=st.session_state.ui_last_report,
                 file_name=f"compliance_report_{current_id}.pdf",
                 mime="application/pdf",
-                use_container_width=True,
+                width='stretch',
                 key=f"persistent_report_{current_id}",
             )
 
@@ -2547,7 +2742,7 @@ with tab_database:
 
         display_df = filtered[["id", "product_name", "category", "timestamp", "score", "status"]].copy()
         display_df.columns = ["ID", "Product", "Category", "Timestamp", "Compliance", "Status"]
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, width='stretch', hide_index=True)
 
         if not filtered.empty:
             selected_id = st.selectbox(
